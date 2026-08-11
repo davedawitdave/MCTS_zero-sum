@@ -1,0 +1,31 @@
+# Virtual environment folder
+.venv/
+venv/
+ENV/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+
+# IDE files (Optional)
+.vscode/
+.idea/
+build_notebook.py
+tic_tac_toe_player_mcts.ipynb
