@@ -87,6 +87,51 @@ def make_random_rollout_eval(rng) -> EvalFn:
     return fn
 
 
+_DEFAULT_GROUP_RANK: Dict[str, int] = {"center": 0, "corner": 1, "edge": 2}
+
+
+def make_heuristic_rollout_eval(rng, group_rank: Optional[Dict[str, int]] = None) -> EvalFn:
+    """Rollout guided by a light heuristic instead of pure randomness: at each ply, take an
+    immediate win if one exists, else avoid a move that hands the opponent an immediate
+    win next turn, else prefer center > corner > edge among what's left. A uniformly
+    random playout on a 3x3 board is noisy enough that it under-counts how bad "hand the
+    opponent an open line" really is (see mcts_games.ipynb's rollout-bottleneck note); this
+    cuts that noise the same way a real player would, without hardcoding either game --
+    it only uses the generic Game interface (check_winner/legal_moves/apply_move) plus
+    action_group's center/corner/edge banding, so it works for Classic and Numerical alike.
+    """
+    ranks = group_rank or _DEFAULT_GROUP_RANK
+
+    def choose(game: eng.Game, board: eng.Board, mover: int) -> eng.Action:
+        legal = game.legal_moves(board)
+        for a in legal:
+            if game.check_winner(game.apply_move(board, a, mover)) == mover:
+                return a
+        opponent = 1 if mover == 2 else 2
+
+        def hands_opponent_a_win(a: eng.Action) -> bool:
+            after = game.apply_move(board, a, mover)
+            if game.is_terminal(after):
+                return False
+            return any(game.check_winner(game.apply_move(after, b, opponent)) == opponent
+                       for b in game.legal_moves(after))
+
+        safe = [a for a in legal if not hands_opponent_a_win(a)]
+        pool = safe if safe else legal
+        best_rank = min(ranks[eng.action_group(a)] for a in pool)
+        preferred = [a for a in pool if ranks[eng.action_group(a)] == best_rank]
+        return rng.choice(preferred)
+
+    def fn(game: eng.Game, board: eng.Board, player: int) -> float:
+        b = board
+        while not game.is_terminal(b):
+            mover = game.player_to_move(b)
+            a = choose(game, b, mover)
+            b = game.apply_move(b, a, mover)
+        return game.reward(b)[player]
+    return fn
+
+
 def make_constant_value(values: Dict[int, float]) -> EvalFn:
     """A stand-in for a trained value function: a fixed value per player."""
     def fn(game: eng.Game, board: eng.Board, player: int) -> float:
@@ -95,20 +140,35 @@ def make_constant_value(values: Dict[int, float]) -> EvalFn:
 
 
 def make_uct_selector(c: float = 1.4) -> ScoreFn:
-    """Classic UCT. Untried actions score +inf so every child is tried once first."""
+    """Classic UCT. Untried actions score +inf so every child is tried once first.
+
+    Node.Q() is "value from this node's own mover's perspective" (see MCTSNode.Q). The
+    parent is choosing on behalf of *its own* mover, who is the opposite player from the
+    child's mover (players strictly alternate), so the Q(s,a) the UCT formula wants is
+    1 - child.Q(), not child.Q() directly -- same negamax flip _backprop already applies
+    once per level on the way up. The formula itself (Q + c*sqrt(ln N(s)/N(s,a))) is
+    unchanged; this only fixes which value gets plugged in for Q(s,a).
+    """
     def score(parent: MCTSNode, child: Optional[MCTSNode], prior: float) -> float:
         if child is None or child.N == 0:
             return math.inf
-        return child.Q() + c * math.sqrt(math.log(parent.N + 1) / child.N)
+        q_for_parent = 1.0 - child.Q()
+        return q_for_parent + c * math.sqrt(math.log(parent.N + 1) / child.N)
     return score
 
 
 def make_puct_selector(c: float = 1.4, fpu: float = 0.0) -> ScoreFn:
-    """AlphaZero-style PUCT: exploration weighted by the prior, no singularity at N=0."""
+    """AlphaZero-style PUCT: exploration weighted by the prior, no singularity at N=0.
+
+    Same perspective fix as make_uct_selector: Q(s,a) is 1 - child.Q(), converting the
+    child's own-mover value into the parent's-mover value before comparing. `fpu` is
+    already a direct assumed value for the parent's mover on an untried action, so it is
+    used as-is (no flip). The formula itself is unchanged.
+    """
     def score(parent: MCTSNode, child: Optional[MCTSNode], prior: float) -> float:
         n_child = child.N if child is not None else 0
-        q = child.Q() if (child is not None and child.N > 0) else fpu
-        return q + c * prior * math.sqrt(parent.N + 1) / (1 + n_child)
+        q_for_parent = (1.0 - child.Q()) if (child is not None and child.N > 0) else fpu
+        return q_for_parent + c * prior * math.sqrt(parent.N + 1) / (1 + n_child)
     return score
 
 
@@ -237,7 +297,7 @@ class MCTS:
         if not items:
             return None
         if criterion == "visits":
-            return max(items, key=lambda kv: kv[1].N)[0]
+            return max(items, key=lambda kv: (kv[1].N, kv[1].Q()))[0]
         return max(items, key=lambda kv: kv[1].Q())[0]
 
     def visit_distribution(self) -> Dict[eng.Action, int]:

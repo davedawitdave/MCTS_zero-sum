@@ -313,9 +313,10 @@ class TreeBoardDashboard:
         next_btn.on_click(on_next)
         reset_btn.on_click(on_reset)
 
-        display(header)
-        display(W.HBox([tree_out, board_out]))
-        display(info_out)
+        # One display() call for the whole dashboard -- header, tree+board row, info line --
+        # instead of three separate top-level calls, so exactly one widget renders per
+        # dashboard rather than three stacked output blocks.
+        display(W.VBox([header, W.HBox([tree_out, board_out]), info_out]))
         redraw()
 
 
@@ -388,12 +389,26 @@ def _immediate_threats(game: eng.Game, board: eng.Board, player: int) -> List:
 
 
 def build_human_vs_mcts(game: eng.Game, mcts_factory, human_player: int = 1,
-                         computer_iterations: int = 10):
-    """mcts_factory() -> a fresh mc.MCTS for the computer's move search."""
+                         computer_iterations: int = 10, tree_reuse: bool = False,
+                         computer_starts: Optional[bool] = None,
+                         iterations_for_move=None):
+    """mcts_factory() -> a fresh mc.MCTS for the computer's move search.
+
+    computer_starts, if given, overrides human_player (True -> human is player 2).
+    tree_reuse=True reroots the same search tree onto whichever action was just played
+    (human or computer) instead of rebuilding from scratch every move, via mc.MCTS.reroot.
+    iterations_for_move(move_number), if given, replaces the fixed computer_iterations
+    budget with a per-move schedule (e.g. PlayConfig.iterations_for_move).
+    """
     import ipywidgets as W
     from IPython.display import display, clear_output
 
-    state = {"board": game.initial_board(), "pending_cell": None}
+    if computer_starts is not None:
+        human_player = 2 if computer_starts else 1
+
+    state = {"board": game.initial_board(), "pending_cell": None, "move_count": 0}
+    state["mcts"] = mcts_factory()
+    state["mcts"].new_tree(state["board"])
     board_out = W.Output()
     status_out = W.Output()
     threat_out = W.Output()
@@ -433,39 +448,51 @@ def build_human_vs_mcts(game: eng.Game, mcts_factory, human_player: int = 1,
                 print(f"You created a fork \u2014 threats at cells {cell_list} \u2014 "
                       f"computer can only block one.")
 
-    def finish_move(action):
-        player = game.player_to_move(state["board"])
-        state["board"] = game.apply_move(state["board"], action, player)
-        state["pending_cell"] = None
-        with picker_out:
-            clear_output(wait=True)
-        redraw_board(highlight=eng.action_cell(action))
-        update_threat_status(player)
-        maybe_computer_move()
+    def _advance_tree(action, mover) -> None:
+        """Keep state['mcts'] in lockstep with state['board'] after any move, honouring tree_reuse."""
+        if tree_reuse:
+            state["mcts"].reroot(action)
+        state["board"] = game.apply_move(state["board"], action, mover)
+        if not tree_reuse:
+            state["mcts"].new_tree(state["board"])
+        state["move_count"] += 1
 
-    def maybe_computer_move():
+    def _maybe_take_computer_turn() -> Optional[eng.Action]:
+        """If it's the computer's turn, search and apply its move (no drawing). Returns the
+        action played, or None if it wasn't the computer's turn."""
+        if game.is_terminal(state["board"]):
+            return None
+        mover = game.player_to_move(state["board"])
+        if mover == human_player:
+            return None
+        budget = (iterations_for_move(state["move_count"]) if iterations_for_move
+                  else computer_iterations)
+        state["mcts"].run(budget, record=False)
+        action = state["mcts"].best_action("visits")
+        _advance_tree(action, mover)
+        return action
+
+    def _refresh(highlight=None) -> None:
+        """Redraw the board and status exactly once, reflecting the current state -- called
+        after any pending computer move has already been applied, never before it."""
+        redraw_board(highlight=highlight)
         with status_out:
             clear_output(wait=True)
             if game.is_terminal(state["board"]):
                 w = game.check_winner(state["board"])
                 print(f"{game.mover_label(w)} wins!" if w else "Draw.")
-                return
-            mover = game.player_to_move(state["board"])
-            print(f"{game.mover_label(mover)} to move")
-        if game.player_to_move(state["board"]) not in (None, human_player):
-            m = mcts_factory()
-            m.new_tree(state["board"])
-            m.run(computer_iterations, record=False)
-            action = m.best_action("visits")
-            state["board"] = game.apply_move(state["board"], action, m.root().player)
-            redraw_board(highlight=eng.action_cell(action))
-            with status_out:
-                clear_output(wait=True)
-                if game.is_terminal(state["board"]):
-                    w = game.check_winner(state["board"])
-                    print(f"{game.mover_label(w)} wins!" if w else "Draw.")
-                else:
-                    print(f"{game.mover_label(game.player_to_move(state['board']))} to move")
+            else:
+                print(f"{game.mover_label(game.player_to_move(state['board']))} to move")
+
+    def finish_move(action):
+        player = game.player_to_move(state["board"])
+        _advance_tree(action, player)
+        state["pending_cell"] = None
+        with picker_out:
+            clear_output(wait=True)
+        update_threat_status(player)
+        computer_action = _maybe_take_computer_turn()
+        _refresh(highlight=eng.action_cell(computer_action if computer_action is not None else action))
 
     def on_cell_click(cell):
         def handler(_):
@@ -480,7 +507,6 @@ def build_human_vs_mcts(game: eng.Game, mcts_factory, human_player: int = 1,
             numbers = game.remaining_numbers(state["board"], human_player)
             with picker_out:
                 clear_output(wait=True)
-                display(W.Label(f"place which number in cell {cell}?"))
                 num_buttons = [W.Button(description=str(n), layout=W.Layout(width="42px"))
                                for n in numbers]
 
@@ -491,7 +517,8 @@ def build_human_vs_mcts(game: eng.Game, mcts_factory, human_player: int = 1,
 
                 for b, n in zip(num_buttons, numbers):
                     b.on_click(make_num_handler(n))
-                display(W.HBox(num_buttons))
+                display(W.VBox([W.Label(f"place which number in cell {cell}?"),
+                                 W.HBox(num_buttons)]))
         return handler
 
     for cell in range(9):
@@ -504,15 +531,17 @@ def build_human_vs_mcts(game: eng.Game, mcts_factory, human_player: int = 1,
     def on_reset(_):
         state["board"] = game.initial_board()
         state["pending_cell"] = None
+        state["move_count"] = 0
+        state["mcts"].new_tree(state["board"])
         with picker_out:
             clear_output(wait=True)
         with threat_out:
             clear_output(wait=True)
-        redraw_board()
-        maybe_computer_move()
+        computer_action = _maybe_take_computer_turn()
+        _refresh(highlight=eng.action_cell(computer_action) if computer_action is not None else None)
 
     reset_btn.on_click(on_reset)
 
     display(W.VBox([W.HBox([board_out, grid]), picker_out, threat_out, status_out, reset_btn]))
-    redraw_board()
-    maybe_computer_move()
+    opening_action = _maybe_take_computer_turn()
+    _refresh(highlight=eng.action_cell(opening_action) if opening_action is not None else None)

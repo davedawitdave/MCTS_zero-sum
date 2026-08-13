@@ -34,6 +34,13 @@ SCENARIO_PURE_UCT = ScenarioConfig(
     mode="uct", c=1.4, n_iterations=10, seed=7,
 )
 
+# Center > corner > edge, edges kept strictly positive (never 0) so they stay reachable.
+BAND_WEIGHTS: Dict[int, float] = {
+    4: 0.40,
+    0: 0.12, 2: 0.12, 6: 0.12, 8: 0.12,
+    1: 0.03, 3: 0.03, 5: 0.03, 7: 0.03,
+}
+
 SCENARIO_PUCT_PRIOR = ScenarioConfig(
     name="PUCT with hand-set priors",
     game=eng.CLASSIC,
@@ -44,11 +51,7 @@ SCENARIO_PUCT_PRIOR = ScenarioConfig(
         "value function instead of a rollout."
     ),
     mode="puct", c=1.4, n_iterations=10, seed=1,
-    cell_weights={
-        4: 0.40,
-        0: 0.12, 2: 0.12, 6: 0.12, 8: 0.12,
-        1: 0.03, 3: 0.03, 5: 0.03, 7: 0.03,
-    },
+    cell_weights=BAND_WEIGHTS,
     values={1: 0.62, 2: 0.38},
 )
 
@@ -65,6 +68,97 @@ def build_mcts(cfg: ScenarioConfig) -> mc.MCTS:
     else:
         raise ValueError(f"unknown mode {cfg.mode!r}")
     return mc.MCTS(cfg.game, score_fn, eval_fn, prior_fn, seed=cfg.seed)
+
+
+@dataclass
+class PlayConfig:
+    """One knob-panel for the interactive demos: search budget, selection, priors, tree
+    reuse, who moves first, and how leaves get evaluated. Feeds build_mcts_from_playconfig
+    and viz.build_human_vs_mcts -- nothing here changes the UCT/PUCT formulas themselves."""
+
+    # Search budget
+    n_iterations: int = 500                       # default per move -- see notebook note on budgets
+    use_graded_budget: bool = False               # if True: first move 30, later moves 20-28
+    graded_schedule: Tuple[int, ...] = (30, 28, 24, 20)
+
+    # Selection
+    mode: str = "uct"                             # "uct" | "puct"
+    c: float = 1.414                               # sqrt(2) default
+    fpu: float = 0.0                               # for PUCT only
+
+    # Priors / branching bias
+    prior_style: str = "band"                      # "uniform" | "band"
+    # "band"    = center > corner > edge (BAND_WEIGHTS above) -- the codebase default.
+    # "uniform" = flat over legal moves.
+    # A "lines" style (bias toward cells that complete/block a winning line) is a natural
+    # next step but isn't wired up here -- see the notebook markdown.
+
+    # Tree reuse
+    tree_reuse: bool = True                        # reroot() between moves instead of rebuilding
+
+    # Who starts (human-vs-MCTS widget)
+    computer_starts: bool = True
+
+    # Leaf evaluation
+    eval_style: str = "heuristic_rollout"           # "heuristic_rollout" | "rollout" | "constant" | "net"
+    # "heuristic_rollout" plays win>block>center/corner/edge during the rollout instead of
+    # pure randomness -- far less noisy on a 3x3 board (see mcts.make_heuristic_rollout_eval).
+    # "rollout" is the pure-random version used by the pedagogical baseline-story scenarios.
+    values: Optional[Dict[int, float]] = None        # used when eval_style == "constant"
+    seed: int = 0
+
+    def iterations_for_move(self, move_number: int) -> int:
+        """Iteration budget for the move_number-th (0-indexed) search this config drives."""
+        if not self.use_graded_budget:
+            return self.n_iterations
+        schedule = self.graded_schedule
+        return schedule[move_number] if move_number < len(schedule) else schedule[-1]
+
+
+def _prior_fn_for_playconfig(cfg: PlayConfig) -> mc.PriorFn:
+    if cfg.prior_style == "band":
+        return mc.make_constant_prior(BAND_WEIGHTS)
+    if cfg.prior_style == "uniform":
+        return mc.uniform_prior
+    raise NotImplementedError(
+        f"prior_style={cfg.prior_style!r} is a future idea, not wired up yet -- "
+        "use 'band' or 'uniform' (see the notebook markdown)."
+    )
+
+
+def _eval_fn_for_playconfig(cfg: PlayConfig, game: eng.Game, net: Optional["TinyNet"],
+                             rng: random.Random) -> mc.EvalFn:
+    if cfg.eval_style == "heuristic_rollout":
+        return mc.make_heuristic_rollout_eval(rng)
+    if cfg.eval_style == "rollout":
+        return mc.make_random_rollout_eval(rng)
+    if cfg.eval_style == "constant":
+        return mc.make_constant_value(cfg.values or {p: 0.5 for p in eng.PLAYERS})
+    if cfg.eval_style == "net":
+        active_net = net if net is not None else TinyNet(game=game, seed=cfg.seed)
+        return net_as_eval_fn(active_net)
+    raise ValueError(f"unknown eval_style {cfg.eval_style!r}")
+
+
+def build_mcts_from_playconfig(cfg: PlayConfig, game: eng.Game,
+                                net: Optional["TinyNet"] = None,
+                                seed: Optional[int] = None) -> mc.MCTS:
+    """Build one mc.MCTS wired from a PlayConfig: mode/c/fpu pick the existing selector,
+    prior_style picks the prior, eval_style picks the leaf evaluator. No new search logic --
+    this only assembles the pieces mcts.py already provides."""
+    use_seed = cfg.seed if seed is None else seed
+    rng = random.Random(use_seed)
+
+    if cfg.mode == "uct":
+        score_fn = mc.make_uct_selector(c=cfg.c)
+    elif cfg.mode == "puct":
+        score_fn = mc.make_puct_selector(c=cfg.c, fpu=cfg.fpu)
+    else:
+        raise ValueError(f"unknown mode {cfg.mode!r}")
+
+    prior_fn = _prior_fn_for_playconfig(cfg)
+    eval_fn = _eval_fn_for_playconfig(cfg, game, net, rng)
+    return mc.MCTS(game, score_fn, eval_fn, prior_fn, seed=use_seed)
 
 
 _GROUP_RANK: Dict[str, int] = {"center": 0, "corner": 1, "edge": 2}
@@ -340,7 +434,23 @@ def self_check() -> None:
                 analytic = grad[idx]
                 assert abs(numeric - analytic) < 1e-3, (game.name, name, idx, numeric, analytic)
 
-    print("scenarios self-check passed (opponent ladder + gradient check, both games)")
+    cfg = PlayConfig(n_iterations=6, mode="uct", prior_style="uniform", eval_style="rollout", seed=2)
+    m = build_mcts_from_playconfig(cfg, eng.CLASSIC)
+    m.new_tree(eng.CLASSIC.initial_board())
+    m.run(cfg.n_iterations, record=False)
+    assert m.best_action("visits") is not None
+
+    cfg2 = PlayConfig(n_iterations=6, mode="puct", prior_style="band", eval_style="constant",
+                       values={1: 0.6, 2: 0.4}, seed=2)
+    m2 = build_mcts_from_playconfig(cfg2, eng.NUMERICAL)
+    m2.new_tree(eng.NUMERICAL.initial_board())
+    m2.run(cfg2.n_iterations, record=False)
+    assert m2.best_action("visits") is not None
+
+    graded = PlayConfig(use_graded_budget=True, graded_schedule=(30, 28, 24, 20))
+    assert [graded.iterations_for_move(i) for i in range(6)] == [30, 28, 24, 20, 20, 20]
+
+    print("scenarios self-check passed (opponent ladder + gradient check + PlayConfig wiring, both games)")
 
 
 if __name__ == "__main__":
